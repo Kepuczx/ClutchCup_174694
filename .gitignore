@@ -1,7 +1,14 @@
 .venv/
+env/
+venv/
 __pycache__/
 *.py[cod]
-db.sqlite3
+*$py.class
+*.sqlite3
+*.db
 .env
-.vscode/
 .idea/
+.vscode/
+*.swp
+CLAUDE.md
+.claude/
