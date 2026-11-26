@@ -220,10 +220,10 @@ Wynik jest deterministyczny: te same dane wejściowe zawsze dają te same pary.
 
 | INV | Constraint DB | Serializator | Akcja w `atomic()` + blokada |
 |---|---|---|---|
-| 01 | – | – | `register`, `update` (open) |
+| 01 | – | `TournamentModelSerializer.validate_max_teams` (pkt 5, wywoływany pod blokadą w `update`) | `register`, `update` (open) |
 | 02 | – | – | `register` |
 | 03 | – | – | `register`, `confirm` |
-| 04 | – | `TeamModelSerializer` (pkt 3) | `register`, `confirm`, `update` drużyny (pkt 2) |
+| 04 | – | `TeamModelSerializer.validate_member_ids` (pkt 2 → `ConflictError`, pkt 3) | `register`, `confirm` |
 | 05 | – | `GameSerializer.validate_team_size` | – |
 | 06 | – | `can_cancel_until` (informacyjnie) | `cancel` |
 | 07 | `unique_tournament_team_registration` | – | `register` |

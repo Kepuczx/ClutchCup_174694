@@ -161,14 +161,21 @@ Obiekt niewidoczny daje **404**, nie 403.
 ```json
 {
   "id": 12, "title": "ClutchCup Winter #1", "slug": "clutchcup-winter-1",
+  "short_description": "Amatorski turniej 5v5 dla drużyn z całej Polski…",
   "game_name": "Counter-Strike 2", "format": "single_elimination", "status": "open",
   "start_date": "2026-12-12T18:00:00+01:00", "registration_deadline": "2026-12-10T23:59:00+01:00",
-  "prize_pool": "1500.00", "entry_fee": "0.00",
+  "prize_pool": "1500.00", "entry_fee": "0.00", "is_free": true,
   "max_teams": 8, "slots_taken": 5, "slots_left": 3,
   "tags": ["cs2", "5v5", "amateur"]
 }
 ```
-`slots_taken` i `slots_left` to `SerializerMethodField` oparte na adnotacji `active_registrations_count` (zgłoszenia `pending` + `confirmed`). `tags` zwraca listę nazw.
+Pola wyliczane (`SerializerMethodField`):
+- `short_description`: `description` przycięty do 120 znaków (`Truncator.chars`, z „…”).
+- `slots_taken`: liczba aktywnych zgłoszeń (`pending` + `confirmed`) z adnotacji `active_registrations_count`. Gdy adnotacji nie ma, liczona osobnym zapytaniem.
+- `slots_left`: `max(max_teams − slots_taken, 0)`.
+- `is_free`: `entry_fee == 0`.
+
+`tags` zwraca listę nazw.
 
 `TournamentModelSerializer` (szczegóły i zapis):
 ```json

@@ -18,6 +18,16 @@ MAX_TEAM_MEMBERS = 12
 MIN_TEAMS_TO_START = 2
 CANCELLATION_CUTOFF = timedelta(hours=24)
 
+STEAM_ID_VALIDATOR = RegexValidator(
+    r'^7656119\d{10}$', 'Nieprawidłowy SteamID64 (17 cyfr, prefiks 7656119).'
+)
+TAG_NAME_VALIDATOR = RegexValidator(
+    r'^[a-z0-9]+$', 'Tag może zawierać tylko małe litery i cyfry, bez znaku #.'
+)
+TEAM_TAG_VALIDATOR = RegexValidator(
+    r'^[A-Z0-9]{2,5}$', 'Skrót drużyny to 2–5 wielkich liter lub cyfr.'
+)
+
 
 def unique_slug(instance, source):
     max_length = instance._meta.get_field('slug').max_length
@@ -67,12 +77,7 @@ class UserProfile(models.Model):
         max_length=17,
         blank=True,
         default='',
-        validators=[
-            RegexValidator(
-                r'^7656119\d{10}$',
-                'Nieprawidłowy SteamID64 (17 cyfr, prefiks 7656119).',
-            )
-        ],
+        validators=[STEAM_ID_VALIDATOR],
     )
     is_verified = models.BooleanField('zweryfikowany', default=False)
 
@@ -129,12 +134,7 @@ class Tag(AutoSlugMixin, models.Model):
         'nazwa',
         max_length=30,
         unique=True,
-        validators=[
-            RegexValidator(
-                r'^[a-z0-9]+$',
-                'Tag może zawierać tylko małe litery i cyfry, bez znaku #.',
-            )
-        ],
+        validators=[TAG_NAME_VALIDATOR],
         error_messages={'unique': 'Taki tag już istnieje.'},
     )
     slug = models.SlugField('slug', max_length=40, unique=True, blank=True)
@@ -154,12 +154,7 @@ class Team(AutoSlugMixin, models.Model):
     tag = models.CharField(
         'skrót',
         max_length=5,
-        validators=[
-            RegexValidator(
-                r'^[A-Z0-9]{2,5}$',
-                'Skrót drużyny to 2–5 wielkich liter lub cyfr.',
-            )
-        ],
+        validators=[TEAM_TAG_VALIDATOR],
     )
     captain = models.ForeignKey(
         settings.AUTH_USER_MODEL,
