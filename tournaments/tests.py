@@ -4,9 +4,11 @@ from types import SimpleNamespace
 
 from django.contrib.auth.models import User
 from django.db.models import Count, Q
-from django.test import TestCase
+from django.test import TestCase, override_settings
+from django.urls import reverse
 from django.utils import timezone
-from rest_framework import serializers
+from rest_framework import serializers, status
+from rest_framework.test import APITestCase
 
 from .exceptions import ConflictError
 from .models import (
@@ -35,6 +37,7 @@ from .serializers import (
 )
 
 STRONG_PASSWORD = 'Trudne!Haslo123'
+FAST_HASHERS = ['django.contrib.auth.hashers.MD5PasswordHasher']
 
 
 def make_user(username, role=UserProfile.Role.PLAYER, **profile):
@@ -43,6 +46,7 @@ def make_user(username, role=UserProfile.Role.PLAYER, **profile):
     return user
 
 
+@override_settings(PASSWORD_HASHERS=FAST_HASHERS)
 class SerializerTestBase(TestCase):
     @classmethod
     def setUpTestData(cls):
@@ -482,3 +486,519 @@ class RegistrationAndMatchSerializerTests(SerializerTestBase):
         data = MatchSerializer(match).data
         self.assertEqual(data['team_a']['tag'], 'CK')
         self.assertIsNone(data['winner'])
+
+
+def url(name, *args):
+    return reverse(f'tournaments:{name}', args=args)
+
+
+@override_settings(PASSWORD_HASHERS=FAST_HASHERS)
+class ApiTestBase(APITestCase):
+    def setUp(self):
+        self.now = timezone.now()
+        self.organizer = make_user('org', role=UserProfile.Role.ORGANIZER, is_verified=True)
+        self.game = Game.objects.create(name='Counter-Strike 2', team_size=2)
+        self.team = self.make_team('Clutch Kings', 'CK')
+        self.captain = self.team.captain
+        self.tournament = self.make_tournament()
+
+    def make_team(self, name, tag, size=2):
+        captain = make_user(f'{tag.lower()}_cap')
+        team = Team.objects.create(name=name, tag=tag, captain=captain)
+        team.members.set([captain, *(make_user(f'{tag.lower()}_p{i}') for i in range(size - 1))])
+        return team
+
+    def make_tournament(self, **overrides):
+        data = {
+            'title': 'ClutchCup Winter',
+            'game': self.game,
+            'organizer': self.organizer,
+            'max_teams': 4,
+            'status': Tournament.Status.OPEN,
+            'is_published': True,
+            'registration_deadline': self.now + timedelta(days=5),
+            'start_date': self.now + timedelta(days=7),
+        }
+        data.update(overrides)
+        return Tournament.objects.create(**data)
+
+    def register(self, team, tournament=None):
+        tournament = tournament or self.tournament
+        self.client.force_authenticate(team.captain)
+        return self.client.post(url('tournament-register', tournament.pk), {'team': team.pk})
+
+    def registration(self, team, reg_status=TournamentRegistration.Status.CONFIRMED, tournament=None):
+        return TournamentRegistration.objects.create(
+            tournament=tournament or self.tournament, team=team, status=reg_status
+        )
+
+    def set_dates(self, tournament, deadline, start):
+        Tournament.objects.filter(pk=tournament.pk).update(
+            registration_deadline=deadline, start_date=start
+        )
+        tournament.refresh_from_db()
+
+    def active_count(self, tournament=None):
+        return (tournament or self.tournament).registrations.filter(
+            status__in=TournamentRegistration.ACTIVE_STATUSES
+        ).count()
+
+
+class TournamentVisibilityApiTests(ApiTestBase):
+    def setUp(self):
+        super().setUp()
+        self.other_organizer = make_user('org2', role=UserProfile.Role.ORGANIZER)
+        self.private_draft = self.make_tournament(
+            title='Prywatny szkic', organizer=self.other_organizer,
+            status=Tournament.Status.DRAFT, is_published=False,
+        )
+
+    def test_anonymous_sees_only_published(self):
+        response = self.client.get(url('tournament-list'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([t['id'] for t in response.data['results']], [self.tournament.pk])
+
+    def test_foreign_draft_is_404_and_own_draft_visible(self):
+        self.client.force_authenticate(self.organizer)
+        response = self.client.get(url('tournament-detail', self.private_draft.pk))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.client.force_authenticate(self.other_organizer)
+        response = self.client.get(url('tournament-detail', self.private_draft.pk))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_list_query_count_is_constant(self):
+        for i in range(3):
+            self.make_tournament(title=f'Dodatkowy turniej {i}')
+        with self.assertNumQueries(3):
+            self.client.get(url('tournament-list'))
+
+    def test_tags_filter_does_not_inflate_slot_counter(self):
+        cs2, lan = Tag.objects.create(name='cs2'), Tag.objects.create(name='lan')
+        self.tournament.tags.set([cs2, lan])
+        self.registration(self.team)
+        response = self.client.get(url('tournament-list'), {'tags': ['cs2', 'lan']})
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['slots_taken'], 1)
+
+    def test_has_free_slots_filter(self):
+        full = self.make_tournament(title='Pełny turniej', max_teams=2)
+        self.registration(self.team, tournament=full)
+        self.registration(self.make_team('Aim Academy', 'AIM'), tournament=full)
+        response = self.client.get(url('tournament-list'), {'has_free_slots': 'false'})
+        self.assertEqual([t['id'] for t in response.data['results']], [full.pk])
+
+    def test_upcoming_lists_published_future_draft_and_open(self):
+        announced = self.make_tournament(title='Zapowiedź', status=Tournament.Status.DRAFT)
+        self.make_tournament(title='W trakcie', status=Tournament.Status.ONGOING)
+        response = self.client.get(url('tournament-upcoming'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            {t['id'] for t in response.data['results']}, {self.tournament.pk, announced.pk}
+        )
+
+
+class RegisterApiTests(ApiTestBase):
+    def test_success(self):
+        response = self.register(self.team)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data['status'], 'pending')
+        self.assertEqual(response.data['slots_left'], 3)
+
+    def test_anonymous_401(self):
+        response = self.client.post(
+            url('tournament-register', self.tournament.pk), {'team': self.team.pk}
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_invisible_tournament_404(self):
+        draft = self.make_tournament(
+            title='Szkic prywatny', status=Tournament.Status.DRAFT, is_published=False
+        )
+        self.assertEqual(self.register(self.team, draft).status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_unknown_team_400_and_not_captain_403(self):
+        self.client.force_authenticate(self.captain)
+        response = self.client.post(url('tournament-register', self.tournament.pk), {'team': 999})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        member = self.team.members.exclude(pk=self.captain.pk).get()
+        self.client.force_authenticate(member)
+        response = self.client.post(
+            url('tournament-register', self.tournament.pk), {'team': self.team.pk}
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(
+            response.data['detail'], 'Tylko kapitan drużyny może zgłosić ją do turnieju.'
+        )
+
+    def test_not_open_and_deadline_409(self):
+        announced = self.make_tournament(title='Zapowiedź', status=Tournament.Status.DRAFT)
+        self.assertEqual(self.register(self.team, announced).status_code, status.HTTP_409_CONFLICT)
+        self.set_dates(self.tournament, self.now - timedelta(minutes=1), self.now + timedelta(days=1))
+        response = self.register(self.team)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data['detail'], 'Termin zapisów do tego turnieju minął.')
+
+    def test_duplicate_and_reregistration_after_cancel_409(self):
+        self.assertEqual(self.register(self.team).status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.register(self.team).status_code, status.HTTP_409_CONFLICT)
+        self.tournament.registrations.update(status=TournamentRegistration.Status.CANCELLED)
+        response = self.register(self.team)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn('anulowane', response.data['detail'])
+
+    def test_roster_size_bounds(self):
+        too_small = self.make_team('Solo', 'SOLO', size=1)
+        too_big = self.make_team('Tłum', 'CROWD', size=5)
+        just_right = self.make_team('Max', 'MAX', size=4)
+        response = self.register(too_small)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('od 2 do 4 zawodników', response.data['team'][0])
+        self.assertEqual(self.register(too_big).status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.register(just_right).status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.active_count(), 1)
+
+    def test_organizer_in_team_400(self):
+        self.team.members.add(self.organizer)
+        response = self.register(self.team)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data['team'],
+            ['Organizator turnieju nie może występować w zgłaszanej drużynie.'],
+        )
+
+    def test_player_in_two_teams_409(self):
+        other = self.make_team('Aim Academy', 'AIM')
+        self.registration(other, TournamentRegistration.Status.PENDING)
+        self.team.members.add(other.captain)
+        response = self.register(self.team)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn('aim_cap_nick', response.data['detail'])
+
+    def test_capacity_never_exceeded(self):
+        self.tournament.max_teams = 2
+        self.tournament.save()
+        teams = [self.team, self.make_team('Aim Academy', 'AIM'), self.make_team('Third', 'TRD')]
+        codes = [self.register(team).status_code for team in teams]
+        self.assertEqual(codes, [201, 201, 409])
+        self.assertEqual(self.active_count(), 2)
+        self.tournament.registrations.filter(team=teams[0]).update(
+            status=TournamentRegistration.Status.CANCELLED
+        )
+        self.assertEqual(self.register(teams[2]).status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.active_count(), 2)
+
+    def test_get_on_register_405(self):
+        self.client.force_authenticate(self.captain)
+        response = self.client.get(url('tournament-register', self.tournament.pk))
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
+class RegistrationLifecycleApiTests(ApiTestBase):
+    def cancel(self, registration, user):
+        self.client.force_authenticate(user)
+        return self.client.post(url('registration-cancel', registration.pk), {'reason': 'test'})
+
+    def test_confirm_and_reconfirm(self):
+        registration = self.registration(self.team, TournamentRegistration.Status.PENDING)
+        self.client.force_authenticate(self.organizer)
+        response = self.client.post(url('registration-confirm', registration.pk))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['status'], 'confirmed')
+        response = self.client.post(url('registration-confirm', registration.pk))
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+    def test_confirm_rechecks_roster(self):
+        registration = self.registration(self.team, TournamentRegistration.Status.PENDING)
+        self.team.members.remove(*self.team.members.exclude(pk=self.captain.pk))
+        self.client.force_authenticate(self.organizer)
+        response = self.client.post(url('registration-confirm', registration.pk))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        registration.refresh_from_db()
+        self.assertEqual(registration.status, TournamentRegistration.Status.PENDING)
+
+    def test_captain_cancels_pending_one_day_before_start(self):
+        self.set_dates(self.tournament, self.now + timedelta(hours=12), self.now + timedelta(hours=23))
+        registration = self.registration(self.team, TournamentRegistration.Status.PENDING)
+        self.assertEqual(self.cancel(registration, self.captain).status_code, status.HTTP_200_OK)
+
+    def test_captain_cancels_confirmed_48h_before_start(self):
+        self.set_dates(self.tournament, self.now + timedelta(hours=24), self.now + timedelta(hours=48))
+        registration = self.registration(self.team)
+        response = self.cancel(registration, self.captain)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['status'], 'cancelled')
+
+    def test_captain_cannot_cancel_confirmed_within_24h(self):
+        self.set_dates(self.tournament, self.now + timedelta(hours=22), self.now + timedelta(hours=23))
+        registration = self.registration(self.team)
+        response = self.cancel(registration, self.captain)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn('24 godziny', response.data['detail'])
+        registration.refresh_from_db()
+        self.assertEqual(registration.status, TournamentRegistration.Status.CONFIRMED)
+
+    def test_organizer_cancels_confirmed_one_hour_before_start(self):
+        self.set_dates(self.tournament, self.now + timedelta(minutes=30), self.now + timedelta(hours=1))
+        registration = self.registration(self.team)
+        self.assertEqual(self.cancel(registration, self.organizer).status_code, status.HTTP_200_OK)
+
+    def test_double_cancel_and_after_start_409(self):
+        registration = self.registration(self.team)
+        self.assertEqual(self.cancel(registration, self.captain).status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            self.cancel(registration, self.captain).status_code, status.HTTP_409_CONFLICT
+        )
+        other = self.registration(self.make_team('Aim Academy', 'AIM'))
+        Tournament.objects.filter(pk=self.tournament.pk).update(status=Tournament.Status.ONGOING)
+        self.assertEqual(self.cancel(other, self.organizer).status_code, status.HTTP_409_CONFLICT)
+
+    def test_stranger_403_or_404(self):
+        stranger = make_user('stranger')
+        confirmed = self.registration(self.team)
+        pending = self.registration(
+            self.make_team('Aim Academy', 'AIM'), TournamentRegistration.Status.PENDING
+        )
+        self.assertEqual(self.cancel(confirmed, stranger).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.cancel(pending, stranger).status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_plain_write_methods_are_405(self):
+        registration = self.registration(self.team)
+        self.client.force_authenticate(self.organizer)
+        detail = url('registration-detail', registration.pk)
+        not_allowed = status.HTTP_405_METHOD_NOT_ALLOWED
+        self.assertEqual(self.client.delete(detail).status_code, not_allowed)
+        self.assertEqual(self.client.patch(detail, {'status': 'cancelled'}).status_code, not_allowed)
+        self.assertEqual(self.client.post(url('registration-list'), {}).status_code, not_allowed)
+        self.assertTrue(TournamentRegistration.objects.filter(pk=registration.pk).exists())
+
+    def test_list_requires_auth_and_hides_foreign_pending(self):
+        response = self.client.get(url('registration-list'))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.registration(self.team, TournamentRegistration.Status.PENDING)
+        self.client.force_authenticate(make_user('stranger'))
+        self.assertEqual(self.client.get(url('registration-list')).data['count'], 0)
+        self.client.force_authenticate(self.captain)
+        self.assertEqual(self.client.get(url('registration-list')).data['count'], 1)
+
+
+class TournamentLifecycleApiTests(ApiTestBase):
+    def start(self, tournament=None):
+        self.client.force_authenticate(self.organizer)
+        return self.client.post(url('tournament-start', (tournament or self.tournament).pk))
+
+    def report(self, match, score_a, score_b):
+        return self.client.post(
+            url('match-report-score', match.pk), {'score_a': score_a, 'score_b': score_b}
+        )
+
+    def test_open_registration(self):
+        draft = self.make_tournament(status=Tournament.Status.DRAFT, is_published=False)
+        self.client.force_authenticate(self.organizer)
+        response = self.client.post(url('tournament-open-registration', draft.pk))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual((response.data['status'], response.data['is_published']), ('open', True))
+        response = self.client.post(url('tournament-open-registration', draft.pk))
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+    def test_unverified_organizer_cannot_open(self):
+        UserProfile.objects.filter(user=self.organizer).update(is_verified=False)
+        draft = self.make_tournament(status=Tournament.Status.DRAFT, is_published=False)
+        self.client.force_authenticate(self.organizer)
+        response = self.client.post(url('tournament-open-registration', draft.pk))
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+    def test_create_forces_draft_and_owner(self):
+        self.client.force_authenticate(self.organizer)
+        response = self.client.post(url('tournament-list'), {
+            'title': 'Nowy turniej', 'game_id': self.game.pk, 'status': 'open',
+            'registration_deadline': (self.now + timedelta(days=1)).isoformat(),
+            'start_date': (self.now + timedelta(days=2)).isoformat(),
+        })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual((response.data['status'], response.data['organizer']), ('draft', 'org'))
+
+    def test_open_tournament_edit_rules(self):
+        self.client.force_authenticate(self.organizer)
+        detail = url('tournament-detail', self.tournament.pk)
+        other_game = Game.objects.create(name='Valorant', team_size=5)
+        response = self.client.patch(detail, {'game_id': other_game.pk})
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        response = self.client.patch(detail, {'prize_pool': '-1'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        Tournament.objects.filter(pk=self.tournament.pk).update(prize_pool=Decimal('500'))
+        response = self.client.patch(detail, {'prize_pool': '400'})
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        response = self.client.patch(detail, {'prize_pool': '600', 'title': 'Nowy tytuł'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(self.client.delete(detail).status_code, status.HTTP_409_CONFLICT)
+
+    def test_ongoing_tournament_is_read_only(self):
+        Tournament.objects.filter(pk=self.tournament.pk).update(status=Tournament.Status.ONGOING)
+        self.client.force_authenticate(self.organizer)
+        response = self.client.patch(
+            url('tournament-detail', self.tournament.pk), {'title': 'Zmiana tytułu'}
+        )
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+    def test_delete_draft_204(self):
+        draft = self.make_tournament(status=Tournament.Status.DRAFT, is_published=False)
+        self.client.force_authenticate(self.organizer)
+        response = self.client.delete(url('tournament-detail', draft.pk))
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_start_requires_closed_registration_or_full(self):
+        self.registration(self.team)
+        self.registration(self.make_team('Aim Academy', 'AIM'))
+        self.assertEqual(self.start().status_code, status.HTTP_409_CONFLICT)
+        self.tournament.max_teams = 2
+        self.tournament.save()
+        self.assertEqual(self.start().status_code, status.HTTP_200_OK)
+
+    def test_start_requires_two_confirmed_teams(self):
+        self.set_dates(self.tournament, self.now - timedelta(hours=1), self.now + timedelta(hours=1))
+        self.registration(self.team)
+        self.registration(
+            self.make_team('Aim Academy', 'AIM'), TournamentRegistration.Status.PENDING
+        )
+        self.assertEqual(self.start().status_code, status.HTTP_409_CONFLICT)
+        self.tournament.refresh_from_db()
+        self.assertEqual(self.tournament.status, Tournament.Status.OPEN)
+        self.assertFalse(self.tournament.matches.exists())
+
+    def test_single_elimination_full_run_with_bye(self):
+        self.set_dates(self.tournament, self.now - timedelta(hours=1), self.now + timedelta(hours=1))
+        aim, trd = self.make_team('Aim Academy', 'AIM'), self.make_team('Third', 'TRD')
+        for team in (self.team, aim, trd):
+            self.registration(team)
+        self.registration(self.make_team('Late', 'LATE'), TournamentRegistration.Status.PENDING)
+
+        response = self.start()
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        summary = (
+            response.data['matches_created'], response.data['byes'],
+            response.data['cancelled_pending'],
+        )
+        self.assertEqual(summary, (1, ['CK'], 1))
+        semi = self.tournament.matches.get()
+        self.assertEqual({semi.team_a, semi.team_b}, {aim, trd})
+
+        self.assertEqual(self.report(semi, 10, 10).status_code, status.HTTP_400_BAD_REQUEST)
+        response = self.report(semi, 13, 7)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['next_round_created'])
+        self.assertEqual(self.report(semi, 1, 0).status_code, status.HTTP_409_CONFLICT)
+
+        final = self.tournament.matches.get(round_number=2)
+        self.assertEqual((final.team_a, final.team_b), (self.team, semi.team_a))
+        response = self.report(final, 16, 14)
+        self.assertTrue(response.data['tournament_finished'])
+        self.tournament.refresh_from_db()
+        self.assertEqual(self.tournament.status, Tournament.Status.FINISHED)
+        self.assertEqual(self.report(final, 1, 0).status_code, status.HTTP_409_CONFLICT)
+
+    def test_round_robin_schedule_draws_and_standings(self):
+        Tournament.objects.filter(pk=self.tournament.pk).update(
+            format=Tournament.Format.ROUND_ROBIN
+        )
+        self.set_dates(self.tournament, self.now - timedelta(hours=1), self.now + timedelta(hours=1))
+        teams = [self.team] + [self.make_team(f'Team {tag}', tag) for tag in ('BB', 'CC', 'DD')]
+        for team in teams:
+            self.registration(team)
+        self.assertEqual(self.start().data['matches_created'], 6)
+        rounds = self.tournament.matches.values('round_number').annotate(n=Count('id'))
+        self.assertEqual({r['round_number']: r['n'] for r in rounds}, {1: 2, 2: 2, 3: 2})
+        pairs = {frozenset((m.team_a_id, m.team_b_id)) for m in self.tournament.matches.all()}
+        self.assertEqual(len(pairs), 6)
+
+        matches = list(self.tournament.matches.order_by('id'))
+        for match in matches[:-1]:
+            self.assertFalse(self.report(match, 5, 3).data['tournament_finished'])
+        response = self.report(matches[-1], 2, 2)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['tournament_finished'])
+        self.assertIsNone(response.data['winner'])
+
+        standings = self.client.get(url('tournament-standings', self.tournament.pk)).data
+        self.assertEqual(sum(row['played'] for row in standings), 12)
+        self.assertEqual(sum(row['draws'] for row in standings), 2)
+        points = [row['points'] for row in standings]
+        self.assertEqual(points, sorted(points, reverse=True))
+
+    def test_report_score_outside_ongoing_409(self):
+        match = Match.objects.create(
+            tournament=self.tournament, team_a=self.team,
+            team_b=self.make_team('Aim Academy', 'AIM'), round_number=1,
+        )
+        self.client.force_authenticate(self.organizer)
+        self.assertEqual(self.report(match, 1, 0).status_code, status.HTTP_409_CONFLICT)
+
+    def test_matches_are_read_only(self):
+        self.client.force_authenticate(self.organizer)
+        response = self.client.post(url('match-list'), {})
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
+class DictionaryAndTeamApiTests(ApiTestBase):
+    def test_game_write_requires_staff(self):
+        payload = {'name': 'Valorant', 'team_size': 5}
+        response = self.client.post(url('game-list'), payload)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.client.force_authenticate(self.captain)
+        response = self.client.post(url('game-list'), payload)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        admin = User.objects.create_superuser('root', 'root@example.com', STRONG_PASSWORD)
+        self.client.force_authenticate(admin)
+        response = self.client.post(url('game-list'), payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        response = self.client.delete(url('game-detail', self.game.pk))
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        response = self.client.patch(url('game-detail', self.game.pk), {'team_size': 3})
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+    def test_team_create_sets_captain_and_delete_protected(self):
+        player = make_user('creator')
+        self.client.force_authenticate(player)
+        response = self.client.post(url('team-list'), {'name': 'Nowi', 'tag': 'new'})
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data['captain']['id'], player.pk)
+        self.assertEqual([m['id'] for m in response.data['members']], [player.pk])
+        self.registration(self.team, TournamentRegistration.Status.CANCELLED)
+        self.client.force_authenticate(self.captain)
+        response = self.client.delete(url('team-detail', self.team.pk))
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+
+class PlatformSummaryApiTests(ApiTestBase):
+    def test_summary_aggregates(self):
+        Tournament.objects.filter(pk=self.tournament.pk).update(prize_pool=Decimal('1000'))
+        self.make_tournament(
+            title='Drugi', prize_pool=Decimal('500'), entry_fee=Decimal('20'), max_teams=8
+        )
+        self.make_tournament(
+            title='Ukryty', status=Tournament.Status.DRAFT, is_published=False,
+            prize_pool=Decimal('9999'),
+        )
+        self.registration(self.team)
+        response = self.client.get(url('summary'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.data
+        self.assertEqual(data['tournaments_total'], 2)
+        self.assertEqual(
+            data['tournaments_by_status'], {'draft': 0, 'open': 2, 'ongoing': 0, 'finished': 0}
+        )
+        self.assertEqual(
+            data['prize_pool'],
+            {'total': '1500.00', 'avg': '750.00', 'min': '500.00', 'max': '1000.00'},
+        )
+        self.assertEqual(data['entry_fee']['max'], '20.00')
+        self.assertEqual(data['avg_max_teams'], 6.0)
+        self.assertEqual(data['registrations'], {'active': 1, 'cancelled': 0})
+        self.assertEqual(data['top_games'], [{'game': 'Counter-Strike 2', 'tournaments': 2}])
+
+    def test_summary_on_empty_database(self):
+        Tournament.objects.all().delete()
+        data = self.client.get(url('summary')).data
+        self.assertEqual(data['tournaments_total'], 0)
+        self.assertIsNone(data['prize_pool']['avg'])
+        self.assertIsNone(data['avg_max_teams'])
+        self.assertEqual(data['top_games'], [])

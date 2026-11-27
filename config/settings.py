@@ -166,4 +166,9 @@ SPECTACULAR_SETTINGS = {
     'DESCRIPTION': 'REST API do organizacji i zarządzania turniejami esportowymi.',
     'VERSION': '1.0.0',
     'SERVE_INCLUDE_SCHEMA': False,
+    'ENUM_NAME_OVERRIDES': {
+        'TournamentStatusEnum': 'tournaments.models.Tournament.Status',
+        'RegistrationStatusEnum': 'tournaments.models.TournamentRegistration.Status',
+        'MatchStatusEnum': 'tournaments.models.Match.Status',
+    },
 }

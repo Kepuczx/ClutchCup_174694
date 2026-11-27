@@ -5,6 +5,8 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils import timezone
 from django.utils.text import Truncator
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from .exceptions import ConflictError
@@ -44,7 +46,7 @@ class UserBriefSerializer(serializers.ModelSerializer):
         model = User
         fields = ('id', 'username', 'nickname')
 
-    def get_nickname(self, obj):
+    def get_nickname(self, obj) -> str | None:
         profile = getattr(obj, 'profile', None)
         return profile.nickname if profile else None
 
@@ -215,7 +217,7 @@ class GameSerializer(serializers.ModelSerializer):
         fields = ('id', 'name', 'slug', 'team_size', 'description', 'tournaments_count')
         read_only_fields = ('slug',)
 
-    def get_tournaments_count(self, obj):
+    def get_tournaments_count(self, obj) -> int:
         annotated = getattr(obj, 'tournaments_count', None)
         return annotated if annotated is not None else obj.tournaments.count()
 
@@ -253,11 +255,11 @@ class TeamListSerializer(serializers.ModelSerializer):
         model = Team
         fields = ('id', 'name', 'slug', 'tag', 'captain_nickname', 'members_count')
 
-    def get_captain_nickname(self, obj):
+    def get_captain_nickname(self, obj) -> str:
         profile = getattr(obj.captain, 'profile', None)
         return profile.nickname if profile else obj.captain.username
 
-    def get_members_count(self, obj):
+    def get_members_count(self, obj) -> int:
         annotated = getattr(obj, 'members_count', None)
         return annotated if annotated is not None else obj.members.count()
 
@@ -359,16 +361,16 @@ class TournamentListSerializer(serializers.ModelSerializer):
             'max_teams', 'slots_taken', 'slots_left', 'tags',
         )
 
-    def get_short_description(self, obj):
+    def get_short_description(self, obj) -> str:
         return Truncator(obj.description).chars(SHORT_DESCRIPTION_LENGTH)
 
-    def get_slots_taken(self, obj):
+    def get_slots_taken(self, obj) -> int:
         return active_registrations_count(obj)
 
-    def get_slots_left(self, obj):
+    def get_slots_left(self, obj) -> int:
         return max(obj.max_teams - active_registrations_count(obj), 0)
 
-    def get_is_free(self, obj):
+    def get_is_free(self, obj) -> bool:
         return obj.entry_fee == 0
 
 
@@ -395,7 +397,7 @@ class TournamentModelSerializer(serializers.ModelSerializer):
         )
         read_only_fields = ('slug', 'status', 'created_at')
 
-    def get_slots_taken(self, obj):
+    def get_slots_taken(self, obj) -> int:
         return active_registrations_count(obj)
 
     def validate_max_teams(self, value):
@@ -456,6 +458,7 @@ class TournamentRegistrationSerializer(serializers.ModelSerializer):
         )
         read_only_fields = fields
 
+    @extend_schema_field(OpenApiTypes.DATETIME)
     def get_can_cancel_until(self, obj):
         if obj.tournament.status != Tournament.Status.OPEN:
             return None

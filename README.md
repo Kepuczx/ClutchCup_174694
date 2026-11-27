@@ -53,6 +53,7 @@ Akcje niestandardowe:
 
 | Metoda | Ścieżka |
 |---|---|
+| `GET` | `/tournaments/api/v1/tournaments/upcoming/` |
 | `POST` | `/tournaments/api/v1/tournaments/{id}/open-registration/` |
 | `POST` | `/tournaments/api/v1/tournaments/{id}/register/` |
 | `POST` | `/tournaments/api/v1/tournaments/{id}/start/` |

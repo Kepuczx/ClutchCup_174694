@@ -229,6 +229,9 @@ Filtry `TournamentFilter`:
 
 `?search=` po `title`, `description`, `game__name`. `?ordering=` po `start_date`, `registration_deadline`, `prize_pool`, `entry_fee`, `created_at`. Domyślnie `start_date`.
 
+### D.2a. `GET tournaments/upcoming/` (akcja kolekcji)
+Publiczny. Nadchodzące turnieje: `is_published=True`, `status ∈ {draft, open}` (zapowiedzi i otwarte zapisy), `start_date > now`, sortowanie po `start_date`. Obsługuje te same filtry i wyszukiwanie co lista. Paginacja i `TournamentListSerializer`.
+
 ### D.3. `POST tournaments/{id}/open-registration/`
 Właściciel. Brak body. Przejście `draft → open` i ustawienie `is_published=True` (INV-08).
 **200** → `TournamentModelSerializer`. Błędy: 401, 403, 404, **409** (status ≠ `draft`; `registration_deadline <= now`; organizator bez `is_verified`).
@@ -267,10 +270,13 @@ Sprawdzenia wykonywane **w tej kolejności** (pierwszy niespełniony warunek dec
 | 11 | żaden zawodnik nie gra w innej aktywnie zgłoszonej drużynie (INV-04) | 409 | „Zawodnicy {lista nicków} są już zgłoszeni do tego turnieju w innej drużynie.” |
 | 12 | wolne miejsce (INV-01) | 409 | „Brak wolnych miejsc – turniej osiągnął limit {max_teams} drużyn.” |
 
-**201**:
+**201**: `TournamentRegistrationSerializer` (jak w sekcji E) rozszerzony o `slots_left`:
 ```json
-{"id": 41, "tournament": 12, "team": {"id": 3, "name": "Clutch Kings", "tag": "CK"},
- "status": "pending", "registered_at": "2026-12-01T10:15:00+01:00", "slots_left": 2}
+{"id": 41,
+ "tournament": {"id": 12, "title": "ClutchCup Winter #1", "status": "open", "start_date": "..."},
+ "team": {"id": 3, "name": "Clutch Kings", "tag": "CK"},
+ "status": "pending", "registered_at": "2026-12-01T10:15:00+01:00", "updated_at": "...",
+ "can_cancel_until": "2026-12-12T18:00:00+01:00", "slots_left": 2}
 ```
 `IntegrityError` z `unique_tournament_team_registration` (wyścig) jest mapowany na **409** z komunikatem z wiersza 7.
 
@@ -356,7 +362,7 @@ Organizator turnieju (`IsTournamentOwner` na `obj.tournament`). Request `MatchSc
 
 ## G. Podsumowanie: `GET /tournaments/api/v1/summary/`
 
-`TournamentSummaryView(APIView)`, `AllowAny`. Liczy wyłącznie turnieje widoczne publicznie (`is_published=True`).
+`PlatformSummaryAPIView(APIView)` w `cbv_views.py`, `AllowAny`. Liczy wyłącznie turnieje widoczne publicznie (`is_published=True`).
 ```json
 {
   "tournaments_total": 24,

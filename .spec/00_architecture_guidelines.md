@@ -111,7 +111,7 @@ urlpatterns = [
     path('api/register/', UserRegisterView.as_view(), name='register'),
     path('api/me/', CurrentUserProfileView.as_view(), name='me'),
     path('api/change-password/', ChangePasswordView.as_view(), name='change-password'),
-    path('api/v1/summary/', TournamentSummaryView.as_view(), name='summary'),
+    path('api/v1/summary/', PlatformSummaryAPIView.as_view(), name='summary'),
     path('api/v1/', include(router.urls)),
 ]
 ```

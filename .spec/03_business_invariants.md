@@ -88,13 +88,15 @@ Kapitan wlicza się do składu.
        status__in=TournamentRegistration.ACTIVE_STATUSES,
    ).exclude(team=team)
    clashing = (
-       team.members
-       .filter(teams__registrations__in=other_registrations)
+       User.objects.filter(
+           pk__in=team.members.values('pk'),
+           teams__registrations__in=other_registrations,
+       )
        .select_related('profile')
        .distinct()
    )
    ```
-   Łańcuch `teams__registrations__in` wiąże użytkownika z **tą samą** drużyną, która ma aktywne zgłoszenie. Wykluczenie `team=team` odrzuca zgłoszenie bieżącej drużyny. Naruszenie daje **409** „Zawodnicy {nick1, nick2} są już zgłoszeni do tego turnieju w innej drużynie.”
+   Łańcuch `teams__registrations__in` wiąże użytkownika z drużyną, która ma aktywne zgłoszenie. Wykluczenie `team=team` odrzuca zgłoszenie bieżącej drużyny. **Nie wolno** zaczynać od `team.members.filter(...)`: menedżer relacji M2M ma „lepki” filtr (`teams=team`), więc `teams__registrations` wskazywałoby na bieżącą drużynę i kolizja nigdy nie zostałaby wykryta. Naruszenie daje **409** „Zawodnicy {nick1, nick2} są już zgłoszeni do tego turnieju w innej drużynie.”
 2. **Zamrożenie składu.** Jeśli drużyna ma **potwierdzone** zgłoszenie do turnieju w statusie `open` lub `ongoing`, zmiana `member_ids` (PUT/PATCH `teams/{id}/`) daje **409** „Skład drużyny jest zamrożony, ponieważ drużyna ma potwierdzone zgłoszenie do trwającego turnieju.” Zmiana `name`/`tag` pozostaje dozwolona. Przy zgłoszeniach `pending` skład można zmieniać, a poprawność ponownie weryfikuje `confirm`.
 3. Kapitan zawsze należy do `members`. Usunięcie go z `member_ids` jest ignorowane, bo kapitan jest dopisywany ponownie.
 
@@ -202,7 +204,7 @@ Wynik jest deterministyczny: te same dane wejściowe zawsze dają te same pary.
 4. **Przejście rundy (`single_elimination`)**, jeśli wszystkie mecze rundy `r` są `completed`:
    - uczestnicy rundy `r+1`: dla `r == 1` najpierw drużyny z wolnym losem (w kolejności rozstawienia), potem zwycięzcy meczów rundy 1 (wg `match.id`); dla `r >= 2` zwycięzcy meczów rundy `r` (wg `match.id`);
    - pary kolejne: `(u[0], u[1]), (u[2], u[3]), …`;
-   - jeśli runda `r` miała dokładnie 1 mecz (finał), nowa runda nie powstaje i `T.status = 'finished'`.
+   - jeśli awansuje dokładnie 1 drużyna (rozegrano finał), nowa runda nie powstaje i `T.status = 'finished'`. Warunkiem nie jest „runda miała 1 mecz”: przy 3 drużynach runda 1 ma 1 mecz i 1 wolny los, więc awansują 2 drużyny i trzeba rozegrać jeszcze finał.
 5. **`round_robin`:** gdy wszystkie mecze turnieju są `completed` → `T.status = 'finished'`.
 6. Wynik jest niezmienny. Korekta jest możliwa tylko w panelu admina i nie przelicza drabinki.
 
